@@ -1,0 +1,8 @@
+# 统一换行：仓库内文本按 LF 存储；Windows 脚本检出为 CRLF
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
