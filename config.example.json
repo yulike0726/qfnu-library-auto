@@ -24,5 +24,10 @@
   "job_retry_sec": 30,
   "job_max_crashes": 40,
   "verify_at": "08:25",
-  "verify_max_minutes": 4
+  "verify_max_minutes": 4,
+  "dingtalk_webhook": "",
+  "dingtalk_secret": "",
+  "dingtalk_keyword": "图书馆",
+  "dingtalk_at_mobiles": [],
+  "dingtalk_at_all": false
 }

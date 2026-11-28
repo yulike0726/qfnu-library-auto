@@ -134,6 +134,33 @@ python -m qfnu_lib.cli daily
 
 加新账号：复制一份 `config.<名字>.json` 改账号和端口，再复制 `run_daily2.bat` 改成对应 profile，最后在 `tools\watch_qfnu.ps1` 的 `$accounts` 里加一行。
 
+## 钉钉提醒（可选）
+
+签到失败、预约没抢到、签退失败、daemon 连续崩溃时，会推一条钉钉消息，不用自己盯日志。
+
+1. 钉钉群 → 群设置 → 智能群助手 → 添加机器人 → 自定义。安全设置选「自定义关键词」并填 `图书馆`
+   （选了「加签」就把密钥也填进下面的 `dingtalk_secret`）。
+2. 把机器人的 Webhook 填进 `config.json`：
+
+```json
+"dingtalk_webhook": "https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxx",
+"dingtalk_secret": "",
+"dingtalk_keyword": "图书馆",
+"dingtalk_at_mobiles": [],
+"dingtalk_at_all": false
+```
+
+3. 自测：
+
+```bat
+python -m qfnu_lib.cli notify "测试一下"
+```
+
+   打印 `sent: {"errcode":0,"errmsg":"ok"}` 且群里收到消息，就是通了。
+
+告警同时会写进 `logs\alert.log`；08:25 自查发现没签到还会在桌面留一个
+`图书馆签到失败-日期.txt`（签到成功后自动删除）。
+
 ## 配置项
 
 | 键 | 默认值 | 说明 |
@@ -155,6 +182,9 @@ python -m qfnu_lib.cli daily
 | `job_retry_sec` / `job_max_crashes` | `30` / `40` | 任务崩溃（断网、超时）后的重排队间隔与最多重试次数 |
 | `edge_exe` | Edge 默认路径 | 浏览器路径，装在别处时改这里 |
 | `edge_profile` / `cdp_port` | `tools/edge-profile-clean` / `9222` | 独立浏览器用户目录与调试端口，多账号务必不同 |
+| `dingtalk_webhook` / `dingtalk_secret` | 空 | 钉钉机器人 Webhook 与加签密钥；留空则不推送 |
+| `dingtalk_keyword` | `"图书馆"` | 机器人安全设置的关键词，消息里没有会自动补 `【图书馆】` 前缀 |
+| `dingtalk_at_mobiles` / `dingtalk_at_all` | `[]` / `false` | 告警时 @ 的手机号列表 / 是否 @ 所有人 |
 
 ## 常见问题
 

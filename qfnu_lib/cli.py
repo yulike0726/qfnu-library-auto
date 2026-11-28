@@ -11,6 +11,7 @@ commands:
   cancel   cancel today's booking (or check out when cancel is refused)
   daily    resident scheduler: 19:20 book / 21:40 cancel / 08:01 check in / 08:25 verify
   verify   check today's sign-in (08:25 job): emergency check-in + alert when missing
+  notify   send a test DingTalk message (uses dingtalk_webhook from config)
 """
 import json
 import os
@@ -18,7 +19,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from . import api, cas, settings
+from . import api, cas, notify, settings
 
 
 def log(msg):
@@ -32,8 +33,8 @@ def log(msg):
         pass
 
 
-def _alert(msg):
-    """Durable alert line (logs/alert.log) for things the user must know about."""
+def _alert(msg, cfg=None):
+    """Durable alert (logs/alert.log) + 钉钉推送 + 桌面文件，for things the user must know about."""
     log("ALERT: " + msg)
     try:
         os.makedirs(os.path.join(settings.ROOT, "logs"), exist_ok=True)
@@ -41,6 +42,12 @@ def _alert(msg):
             f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
     except OSError:
         pass
+    try:
+        conf = cfg or settings.load()
+        ok, detail = notify.send(conf, f"{msg}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
+        log(f"dingtalk: {'sent' if ok else 'not sent'} ({detail})")
+    except Exception as e:  # 提醒失败绝不能影响主流程
+        log(f"dingtalk failed: {type(e).__name__} {e}")
 
 
 def login(cfg, allow_browser=True):
@@ -200,7 +207,7 @@ def cmd_run(cfg, dry=False):
                 c = c2
         time.sleep(retry)
     log("gave up: check-in window elapsed")
-    _alert(f"签到失败：{cfg.get('account')} 在 {max_minutes} 分钟内没能签到，今天很可能记 1 次违规")
+    _alert(f"签到失败：{cfg.get('account')} 在 {max_minutes} 分钟内没能签到，今天很可能记 1 次违规", cfg)
     return 4
 
 
@@ -270,6 +277,8 @@ def cmd_book(cfg, dry=False, catchup=False):
         return 0
     if not seg or not seat_id:
         log("book: could not prepare segment/seat before the window")
+        _alert(f"预约失败：{cfg.get('account')} 在 19:20 前没查到 {seat_no} 的时段/座位 id，"
+               f"今晚没有预约，需要手动处理", cfg)
         return 3
 
     # 3) wait for the opening (no network calls, so the first confirm is the fastest possible)
@@ -302,6 +311,8 @@ def cmd_book(cfg, dry=False, catchup=False):
             c = login(cfg, allow_browser=False) or c
         time.sleep(retry)
     log("gave up: booking window elapsed")
+    _alert(f"预约失败：{cfg.get('account')} 没约到明天（{day}）的 {seat_no} 号，"
+           f"{window} 分钟内重试都失败，需要手动预约", cfg)
     return 4
 
 
@@ -338,6 +349,8 @@ def cmd_cancel(cfg, dry=False):
                 return 0
             if datetime.now() >= deadline:
                 log("gave up: checkout window elapsed")
+                _alert(f"签退失败：{cfg.get('account')} 今天 {booking.get('name')} 号 21:40 后一直签退不成功，"
+                       f"22:00 前需要手动签退，否则记违规", cfg)
                 return 1
             c = login(cfg, allow_browser=False) or c
             time.sleep(retry)
@@ -350,7 +363,13 @@ def cmd_cancel(cfg, dry=False):
     if booking.get("signInTime") or "禁止取消" in (j.get("msg") or ""):
         code, k = c.checkout()
         log(f"cancel refused -> checkout: {code} {json.dumps(k, ensure_ascii=False)[:300]}")
-        return 0 if k.get("code") == 1 else 1
+        if k.get("code") == 1:
+            return 0
+        _alert(f"取消失败：{cfg.get('account')} 今天 {booking.get('name')} 号既不能取消也签退失败，"
+               f"需要手动处理", cfg)
+        return 1
+    _alert(f"取消失败：{cfg.get('account')} 今天 {booking.get('name')} 号取消被拒："
+           f"{j.get('msg') or j}", cfg)
     return 1
 
 
@@ -391,7 +410,7 @@ def cmd_checkin_window(cfg):
         time.sleep(retry)
     log("gave up: check-in window elapsed")
     _alert(f"签到失败：{cfg.get('account')} 在 {int(cfg.get('checkin_max_minutes', 40))} 分钟内没能签到，"
-           f"今天很可能记 1 次违规")
+           f"今天很可能记 1 次违规", cfg)
     return 4
 
 
@@ -466,7 +485,7 @@ def cmd_verify(cfg):
     except Exception as e:
         log(f"verify: login failed: {type(e).__name__} {e}")
     if not c:
-        _alert(f"自查失败：{cfg.get('account')} 08:25 登录不上，无法确认今天是否签到")
+        _alert(f"自查失败：{cfg.get('account')} 08:25 登录不上，无法确认今天是否签到", cfg)
         _desktop_alert(f"图书馆签到自查失败：{cfg.get('account')} 连接不上图书馆，请手动确认！")
         return 2
     booking, _ = _today_booking(c, statuses=("2", "3", "8"))
@@ -511,7 +530,7 @@ def cmd_verify(cfg):
     msg = (f"图书馆签到失败：{cfg.get('account')} 今天"
            f"{booking.get('nameMerge')} {booking.get('name')} 没有签到成功，"
            f"08:30 后会记 1 次违规，请立即手动处理！")
-    _alert(msg)
+    _alert(msg, cfg)
     _desktop_alert(msg)
     return 4
 
@@ -571,7 +590,7 @@ def cmd_daily(cfg):
                     done.add(key)
                     retry_at.pop(key, None)
                     log(f"job {name}: giving up after {n} crashes: {type(e).__name__} {e}")
-                    _alert(f"任务 {name} 连续崩溃 {n} 次已放弃：{type(e).__name__} {e}")
+                    _alert(f"任务 {name} 连续崩溃 {n} 次已放弃：{type(e).__name__} {e}", cfg)
                 else:
                     retry_at[key] = now + timedelta(seconds=retry_interval)
                     log(f"job {name} crashed ({n}/{max_crashes}), retry in {retry_interval}s: "
@@ -610,6 +629,12 @@ def main(argv):
         return cmd_daily(cfg)
     if cmd == "verify":
         return cmd_verify(cfg)
+    if cmd == "notify":
+        text = " ".join(a for a in argv[2:] if not a.startswith("--"))
+        text = text or "测试消息：图书馆自动化已接通钉钉提醒"
+        ok, detail = notify.send(cfg, text)
+        print(("sent" if ok else "not sent") + ": " + detail)
+        return 0 if ok else 1
     print(__doc__)
     return 64
 
