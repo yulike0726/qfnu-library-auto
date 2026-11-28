@@ -9,7 +9,8 @@ commands:
   run      wait for the booking to become valid, then check in (used by Task Scheduler)
   book     book tomorrow's seat (retry loop until the 19:20 opening)
   cancel   cancel today's booking (or check out when cancel is refused)
-  daily    resident scheduler: 19:20 book / 21:40 cancel / 08:01 check in
+  daily    resident scheduler: 19:20 book / 21:40 cancel / 08:01 check in / 08:25 verify
+  verify   check today's sign-in (08:25 job): emergency check-in + alert when missing
 """
 import json
 import os
@@ -414,6 +415,105 @@ def _catchup(cfg):
             if booking and not booking.get("signInTime"):
                 log("catch-up: today's booking is not signed in -> check in now")
                 cmd_checkin_window(cfg)
+    if "08:25" < hhmm <= "08:29":
+        log("catch-up: inside the 08:25 verify window -> checking today's check-in")
+        cmd_verify(cfg)
+
+
+def _desktop_alert(msg):
+    """Drop a hard-to-miss txt on the desktop (this box has no IM/邮件通道)."""
+    body = (msg + "\n\n"
+            f"时间: {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"日志: {os.path.join(settings.ROOT, 'logs', 'task.log')}\n")
+    name = f"图书馆签到失败-{datetime.now():%Y-%m-%d}.txt"
+    env = os.environ.get("QFNU_ALERT_DIR")
+    if env:
+        dirs = [env]
+    else:
+        home = os.path.expanduser("~")
+        dirs = [os.path.join(home, d) for d in ("Desktop", "OneDrive/Desktop")]
+        dirs = [d for d in dirs if os.path.isdir(d)] or [home]
+    for d in dirs:
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, name), "w", encoding="utf-8-sig") as f:
+                f.write(body)
+            log(f"desktop alert written: {os.path.join(d, name)}")
+        except OSError as e:
+            log(f"desktop alert failed ({d}): {e}")
+
+
+def _clear_desktop_alert():
+    name = f"图书馆签到失败-{datetime.now():%Y-%m-%d}.txt"
+    env = os.environ.get("QFNU_ALERT_DIR")
+    home = os.path.expanduser("~")
+    dirs = [env] if env else [os.path.join(home, d) for d in ("Desktop", "OneDrive/Desktop")]
+    for d in dirs:
+        p = os.path.join(d, name)
+        if d and os.path.exists(p):
+            try:
+                os.remove(p)
+                log(f"stale desktop alert removed: {p}")
+            except OSError:
+                pass
+
+
+def cmd_verify(cfg):
+    """08:25 自查：今天到底签到没有？没签就在 08:30 判定前最后抢救一次并报警。"""
+    c = None
+    try:
+        c = login(cfg, allow_browser=False) or login(cfg)
+    except Exception as e:
+        log(f"verify: login failed: {type(e).__name__} {e}")
+    if not c:
+        _alert(f"自查失败：{cfg.get('account')} 08:25 登录不上，无法确认今天是否签到")
+        _desktop_alert(f"图书馆签到自查失败：{cfg.get('account')} 连接不上图书馆，请手动确认！")
+        return 2
+    booking, _ = _today_booking(c, statuses=("2", "3", "8"))
+    if not booking:
+        log("verify: no active booking today, nothing to check")
+        return 0
+    if booking.get("signInTime"):
+        log(f"verify OK: {booking.get('nameMerge')} {booking.get('name')} "
+            f"signed in at {booking.get('signInTime')}")
+        _clear_desktop_alert()
+        return 0
+    log(f"verify: {booking.get('nameMerge')} {booking.get('name')} 没有签到记录 -> 紧急补签")
+    now = datetime.now()
+    stop = now + timedelta(minutes=float(cfg.get("verify_max_minutes", 4)))
+    cap = now.replace(hour=8, minute=29, second=30, microsecond=0)
+    if stop > cap:
+        stop = cap
+    if stop <= now:
+        stop = now + timedelta(seconds=30)
+    attempt = 0
+    while datetime.now() < stop:
+        attempt += 1
+        try:
+            code, j = c.checkin()
+        except Exception as e:
+            log(f"emergency attempt {attempt} crashed: {type(e).__name__} {e}")
+            time.sleep(15)
+            continue
+        msg = j.get("msg") or ""
+        if j.get("code") == 1:
+            log(f"EMERGENCY CHECK-IN OK after {attempt} attempt(s): "
+                f"{json.dumps(j, ensure_ascii=False)[:300]}")
+            _clear_desktop_alert()
+            return 0
+        if any(k in msg for k in ("已经签到", "已签到", "重复签到", "不用重复签到")):
+            log(f"verify: already signed in ({msg})")
+            return 0
+        log(f"emergency attempt {attempt}: {msg}")
+        if "未生效" not in msg and "network error" not in msg:
+            c = login(cfg, allow_browser=False) or c
+        time.sleep(15)
+    msg = (f"图书馆签到失败：{cfg.get('account')} 今天"
+           f"{booking.get('nameMerge')} {booking.get('name')} 没有签到成功，"
+           f"08:30 后会记 1 次违规，请立即手动处理！")
+    _alert(msg)
+    _desktop_alert(msg)
+    return 4
 
 
 def cmd_daily(cfg):
@@ -422,10 +522,15 @@ def cmd_daily(cfg):
     book_start = cfg.get("book_start_at", "19:15")
     cancel_at = cfg.get("cancel_at", "21:40")
     checkin_at = cfg.get("checkin_at", "08:01")
-    plan = [(book_start, "book", cmd_book), (cancel_at, "cancel", cmd_cancel),
-            (checkin_at, "checkin", cmd_checkin_window)]
+    verify_at = cfg.get("verify_at", "08:25")
+    # (从, 到, 名字, 函数) —— 起止相同表示只在该分钟触发；verify 给一段窗口，
+    # 这样即使 08:01 的签到任务卡到 08:25 之后，自查也不会被错过。
+    plan = [(book_start, book_start, "book", cmd_book),
+            (cancel_at, cancel_at, "cancel", cmd_cancel),
+            (checkin_at, checkin_at, "checkin", cmd_checkin_window),
+            (verify_at, "08:29", "verify", cmd_verify)]
     log(f"daily scheduler up: pre-login {book_start} -> book {book_at} seat {cfg.get('book_seat_no', '043')}, "
-        f"cancel {cancel_at}, checkin {checkin_at}")
+        f"cancel {cancel_at}, checkin {checkin_at}, verify {verify_at}")
     try:
         _catchup(cfg)
     except Exception as e:  # 网络异常不该把常驻进程带走
@@ -440,11 +545,12 @@ def cmd_daily(cfg):
         slot = now.strftime("%Y-%m-%d %H:%M")
         today = now.date().isoformat()
         due = []
-        for hhmm, name, fn in plan:
+        hhmm = slot[-5:]
+        for start, end, name, fn in plan:
             key = (today, name)
             if key in done:
                 continue
-            if slot.endswith(hhmm) or (key in retry_at and now >= retry_at[key]):
+            if start <= hhmm <= end or (key in retry_at and now >= retry_at[key]):
                 due.append((key, name, fn))
         for key, name, fn in due:
             if key in done:
@@ -502,6 +608,8 @@ def main(argv):
         return cmd_cancel(cfg, dry="--dry" in argv)
     if cmd == "daily":
         return cmd_daily(cfg)
+    if cmd == "verify":
+        return cmd_verify(cfg)
     print(__doc__)
     return 64
 

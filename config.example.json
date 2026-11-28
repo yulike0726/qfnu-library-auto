@@ -8,7 +8,7 @@
   "cdp_port": 9222,
   "checkin_advance_sec": 5,
   "checkin_retry_sec": 30,
-  "checkin_max_minutes": 25,
+  "checkin_max_minutes": 22,
   "book_build_id": 39,
   "book_area": 39,
   "book_seat_no": "043",
@@ -22,5 +22,7 @@
   "cancel_retry_sec": 30,
   "cancel_max_minutes": 15,
   "job_retry_sec": 30,
-  "job_max_crashes": 40
+  "job_max_crashes": 40,
+  "verify_at": "08:25",
+  "verify_max_minutes": 4
 }

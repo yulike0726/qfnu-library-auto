@@ -69,7 +69,7 @@ python -m qfnu_lib.cli login
 | `python -m qfnu_lib.cli book` | 预约次日座位（19:20 前会等到开放时间再发请求） |
 | `python -m qfnu_lib.cli cancel` | 取消当天预约（如果已签到，自动改成签退） |
 | `python -m qfnu_lib.cli run` | 等到预约生效的 08:00 再签到（单次执行，定时任务用） |
-| `python -m qfnu_lib.cli daily` | **常驻守护**，按配置时间点自动执行预约/取消/签到（推荐） |
+| `python -m qfnu_lib.cli daily` | **常驻守护**，按配置时间点自动执行预约/取消/签到/自查（推荐） |
 
 通用参数：
 
@@ -89,11 +89,12 @@ python -m qfnu_lib.cli daily
 | 19:15 | 提前登录 + 预先查好次日座位 id（避开 19:20 的登录高峰） |
 | 19:20 | 预约次日座位，失败每 2 秒重试，最多重试 10 分钟 |
 | 21:40 | 取消当天预约；已签到的直接签退，失败每 30 秒重试，最多 15 分钟（赶在 22:00 前完成） |
-| 08:01 | 签到，失败每 30 秒重试，最多 25 分钟 |
+| 08:01 | 签到，失败每 30 秒重试，最多 22 分钟 |
+| 08:25 | **自查**：确认今天真的签到成功；没签到就在 08:30 判定违规前继续补签，仍失败则写 `logs\alert.log` 并在桌面放一个 `图书馆签到失败-<日期>.txt` |
 
-- 启动时会自动补做：已过 19:20 而明天还没约到 → 立即补约；8:00–8:25 还没签到 → 补签。
-- 日志：`logs\task.log`
-- 以上时间点都可以在 `config.json` 里改（`book_start_at`、`book_at`、`cancel_at`、`checkin_at`）。
+- 启动时会自动补做：已过 19:20 而明天还没约到 → 立即补约；8:00–8:25 还没签到 → 补签；8:25–8:29 启动 → 直接跑自查。
+- 日志：`logs\task.log`；需要你人工处理的问题会额外写进 `logs\alert.log`。
+- 以上时间点都可以在 `config.json` 里改（`book_start_at`、`book_at`、`cancel_at`、`checkin_at`、`verify_at`）。
 
 ### 开机自启（可选但建议）
 
@@ -145,10 +146,13 @@ python -m qfnu_lib.cli daily
 | `book_at` | `"19:20"` | 次日预约开放时间 |
 | `cancel_at` | `"21:40"` | 取消/签退时间 |
 | `checkin_at` | `"08:01"` | 签到时间 |
+| `verify_at` | `"08:25"` | 自查时间：确认今天签到成功，没成功就补签并报警 |
+| `verify_max_minutes` | `4` | 自查发现没签到时，最多抢救多少分钟（到 08:29:30 封顶） |
 | `book_window_minutes` | `10` | 预约重试窗口（分钟） |
 | `book_retry_sec` | `2` | 预约重试间隔（秒） |
 | `cancel_retry_sec` / `cancel_max_minutes` | `30` / `15` | 取消/签退重试间隔与窗口 |
-| `checkin_retry_sec` / `checkin_max_minutes` | `30` / `25` | 签到重试间隔与窗口 |
+| `checkin_retry_sec` / `checkin_max_minutes` | `30` / `22` | 签到重试间隔与窗口 |
+| `job_retry_sec` / `job_max_crashes` | `30` / `40` | 任务崩溃（断网、超时）后的重排队间隔与最多重试次数 |
 | `edge_exe` | Edge 默认路径 | 浏览器路径，装在别处时改这里 |
 | `edge_profile` / `cdp_port` | `tools/edge-profile-clean` / `9222` | 独立浏览器用户目录与调试端口，多账号务必不同 |
 
@@ -165,6 +169,12 @@ python -m qfnu_lib.cli daily
 
 **日志在哪？**
 `logs\task.log`（默认账号）、`logs\task-<profile>.log`（多账号）、`logs\watchdog.log`（watchdog）。
+
+**桌面突然出现「图书馆签到失败-xxxx-xx-xx.txt」？**
+说明 08:25 的自查发现当天还没签到成功，8:30 之后会记 1 次违规。立刻去图书馆刷脸/扫码签到，或手动跑 `python -m qfnu_lib.cli in`。同时看 `logs\task.log` 里当天的报错——多数是断网或服务器超时，程序已经在 08:01–08:29 之间反复重试过了。
+
+**断网了会怎样？**
+所有请求的超时、连接失败都会当成「这次没成」继续重试，不会让守护进程崩掉：签到窗口内 30 秒一次，任务整体崩溃则每 30 秒重新排队（最多 40 次）。
 
 **能不能只签到、不预约？**
 可以，把 `config.json` 里的 `book_at` / `cancel_at` 改成一个不会触发的时间（比如 `"00:00"`），只保留 `checkin_at`。
