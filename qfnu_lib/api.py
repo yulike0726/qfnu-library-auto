@@ -46,7 +46,11 @@ class Client:
     def post(self, path, payload=None, encrypted=False, timeout=20):
         body = {"aesjson": encrypt_body(payload)} if encrypted else (payload or {})
         headers = {"authorization": "bearer" + self.token} if self.token else {}
-        r = self.s.post(self.base + path, json=body, headers=headers, timeout=timeout)
+        try:
+            r = self.s.post(self.base + path, json=body, headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            # 网络抖动/超时：当成一次可重试的失败返回，别让上层任务崩掉
+            return 0, {"code": 0, "msg": "network error: %s %s" % (type(e).__name__, e)}
         try:
             return r.status_code, r.json()
         except ValueError:

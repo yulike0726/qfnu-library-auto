@@ -31,6 +31,17 @@ def log(msg):
         pass
 
 
+def _alert(msg):
+    """Durable alert line (logs/alert.log) for things the user must know about."""
+    log("ALERT: " + msg)
+    try:
+        os.makedirs(os.path.join(settings.ROOT, "logs"), exist_ok=True)
+        with open(os.path.join(settings.ROOT, "logs", "alert.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
+
+
 def login(cfg, allow_browser=True):
     """Return an authenticated Client (cached token first, then CASTGC, then browser)."""
     sf = settings.session_file()
@@ -49,15 +60,18 @@ def login(cfg, allow_browser=True):
     except Exception:
         castgc = ""
     if castgc:
-        ticket = cas.ticket_from_castgc(cfg, castgc)
-        if ticket:
-            code = cas.exchange(cfg, ticket)
-            if code:
-                c = api.Client(cfg)
-                if c.exchange_cas(code):
-                    _save(c.token)
-                    log(f"login ok (castgc): {cfg['account']}")
-                    return c
+        try:
+            ticket = cas.ticket_from_castgc(cfg, castgc)
+            if ticket:
+                code = cas.exchange(cfg, ticket)
+                if code:
+                    c = api.Client(cfg)
+                    if c.exchange_cas(code):
+                        _save(c.token)
+                        log(f"login ok (castgc): {cfg['account']}")
+                        return c
+        except Exception as e:
+            log(f"castgc login failed: {type(e).__name__} {e}")
     if not allow_browser:
         return None
     log("CASTGC missing/expired -> solving the slide captcha in Edge")
@@ -75,13 +89,16 @@ def login(cfg, allow_browser=True):
     if not castgc:
         log("browser login failed")
         return None
-    ticket = cas.ticket_from_castgc(cfg, castgc)
-    code = cas.exchange(cfg, ticket) if ticket else ""
-    c = api.Client(cfg) if code else None
-    if c and c.exchange_cas(code):
-        _save(c.token)
-        log(f"login ok (browser): {cfg['account']}")
-        return c
+    try:
+        ticket = cas.ticket_from_castgc(cfg, castgc)
+        code = cas.exchange(cfg, ticket) if ticket else ""
+        c = api.Client(cfg) if code else None
+        if c and c.exchange_cas(code):
+            _save(c.token)
+            log(f"login ok (browser): {cfg['account']}")
+            return c
+    except Exception as e:
+        log(f"browser login token exchange failed: {type(e).__name__} {e}")
     log("token exchange failed")
     return None
 
@@ -160,7 +177,12 @@ def cmd_run(cfg, dry=False):
     attempt = 0
     while datetime.now() < deadline:
         attempt += 1
-        code, j = c.checkin()
+        try:
+            code, j = c.checkin()
+        except Exception as e:
+            log(f"attempt {attempt} crashed: {type(e).__name__} {e}")
+            time.sleep(retry)
+            continue
         msg = j.get("msg", "")
         data = j.get("data") or {}
         if j.get("code") == 1:
@@ -177,6 +199,7 @@ def cmd_run(cfg, dry=False):
                 c = c2
         time.sleep(retry)
     log("gave up: check-in window elapsed")
+    _alert(f"签到失败：{cfg.get('account')} 在 {max_minutes} 分钟内没能签到，今天很可能记 1 次违规")
     return 4
 
 
@@ -332,15 +355,28 @@ def cmd_cancel(cfg, dry=False):
 
 def cmd_checkin_window(cfg):
     """Check in with retries (the 08:01 job)."""
-    c = login(cfg, allow_browser=False) or login(cfg)
-    if not c:
-        return 2
     retry = int(cfg.get("checkin_retry_sec", 60))
     deadline = datetime.now() + timedelta(minutes=int(cfg.get("checkin_max_minutes", 40)))
     attempt = 0
+    c = None
     while datetime.now() < deadline:
         attempt += 1
-        code, j = c.checkin()
+        if not c:
+            try:
+                c = login(cfg, allow_browser=False) or login(cfg)
+            except Exception as e:
+                log(f"check-in login failed: {type(e).__name__} {e}")
+                c = None
+        if not c:
+            time.sleep(retry)
+            continue
+        try:
+            code, j = c.checkin()
+        except Exception as e:
+            log(f"check-in attempt {attempt} crashed: {type(e).__name__} {e}")
+            c = None
+            time.sleep(retry)
+            continue
         msg = j.get("msg", "")
         if j.get("code") == 1:
             log(f"CHECK-IN OK after {attempt} attempt(s): {json.dumps(j, ensure_ascii=False)[:300]}")
@@ -349,10 +385,12 @@ def cmd_checkin_window(cfg):
             log(f"already signed in: {msg}")
             return 0
         log(f"check-in attempt {attempt}: {msg}")
-        if "未生效" not in msg:
+        if "未生效" not in msg and "network error" not in msg:
             c = login(cfg, allow_browser=False) or c
         time.sleep(retry)
     log("gave up: check-in window elapsed")
+    _alert(f"签到失败：{cfg.get('account')} 在 {int(cfg.get('checkin_max_minutes', 40))} 分钟内没能签到，"
+           f"今天很可能记 1 次违规")
     return 4
 
 
@@ -388,23 +426,54 @@ def cmd_daily(cfg):
             (checkin_at, "checkin", cmd_checkin_window)]
     log(f"daily scheduler up: pre-login {book_start} -> book {book_at} seat {cfg.get('book_seat_no', '043')}, "
         f"cancel {cancel_at}, checkin {checkin_at}")
-    _catchup(cfg)
-    done = set()
+    try:
+        _catchup(cfg)
+    except Exception as e:  # 网络异常不该把常驻进程带走
+        log(f"catch-up crashed: {type(e).__name__} {e}")
+    done = set()        # 当天已处理过（成功或彻底放弃）
+    retry_at = {}       # (date, name) -> 下次重试时间
+    crashes = {}        # (date, name) -> 连续崩溃次数
+    retry_interval = int(cfg.get("job_retry_sec", 30))
+    max_crashes = int(cfg.get("job_max_crashes", 40))
     while True:
         now = datetime.now()
         slot = now.strftime("%Y-%m-%d %H:%M")
+        today = now.date().isoformat()
+        due = []
         for hhmm, name, fn in plan:
-            key = (now.date().isoformat(), name)
-            if slot.endswith(hhmm) and key not in done:
-                done.add(key)
+            key = (today, name)
+            if key in done:
+                continue
+            if slot.endswith(hhmm) or (key in retry_at and now >= retry_at[key]):
+                due.append((key, name, fn))
+        for key, name, fn in due:
+            if key in done:
+                continue
+            if key in retry_at:
+                log(f"--- job {name} (retry {crashes.get(key, 0)}) ---")
+            else:
                 log(f"--- job {name} ---")
-                try:
-                    fn(cfg)
-                except Exception as e:  # keep the daemon alive
-                    log(f"job {name} crashed: {type(e).__name__} {e}")
+            try:
+                fn(cfg)
+                done.add(key)
+                retry_at.pop(key, None)
+                crashes.pop(key, None)
+            except Exception as e:  # keep the daemon alive and retry
+                n = crashes.get(key, 0) + 1
+                crashes[key] = n
+                if n >= max_crashes:
+                    done.add(key)
+                    retry_at.pop(key, None)
+                    log(f"job {name}: giving up after {n} crashes: {type(e).__name__} {e}")
+                    _alert(f"任务 {name} 连续崩溃 {n} 次已放弃：{type(e).__name__} {e}")
+                else:
+                    retry_at[key] = now + timedelta(seconds=retry_interval)
+                    log(f"job {name} crashed ({n}/{max_crashes}), retry in {retry_interval}s: "
+                        f"{type(e).__name__} {e}")
         if len(done) > 30:
-            today = now.date().isoformat()
             done = {k for k in done if k[0] == today}
+            retry_at = {k: v for k, v in retry_at.items() if k[0] == today}
+            crashes = {k: v for k, v in crashes.items() if k[0] == today}
         time.sleep(20)
 
 

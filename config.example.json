@@ -20,5 +20,7 @@
   "book_window_minutes": 10,
   "book_retry_sec": 2,
   "cancel_retry_sec": 30,
-  "cancel_max_minutes": 15
+  "cancel_max_minutes": 15,
+  "job_retry_sec": 30,
+  "job_max_crashes": 40
 }
